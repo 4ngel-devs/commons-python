@@ -1,5 +1,5 @@
 def main():
-    print("Hello from phx-common-modules!")
+    print("Hello from commons-python!")
 
 
 if __name__ == "__main__":

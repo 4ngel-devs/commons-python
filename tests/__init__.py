@@ -1,3 +1,3 @@
-"""Tests for phx-common-modules."""
+"""Tests for commons-python."""
 
 

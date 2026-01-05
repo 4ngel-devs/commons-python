@@ -1,4 +1,4 @@
-# PHX Common Modules
+# Commons Python
 
 A shared Python library containing common utilities, data models, and response structures for Phoenix projects.
 
@@ -12,6 +12,7 @@ A shared Python library containing common utilities, data models, and response s
 - **Pagination Utils**: Utilities for working with pagination objects
 - **Keycloak Integration**: Keycloak authentication provider with automatic reconnection
 - **Keycloak User Model**: Model for representing authenticated Keycloak users
+- **Keycloak JWT Decoder**: Decode JWT tokens to extract user information
 - **Date Utils**: Date and datetime utilities with Mexico timezone support
 - **Logging**: Integrated with Loguru for structured logging
 
@@ -49,7 +50,7 @@ uv sync --extra dev
 ## Project Structure
 
 ```
-phx-common-modules/
+commons-python/
 ├── sucrim/
 │   ├── dto/                       # Data Transfer Objects
 │   │   ├── __init__.py
@@ -76,6 +77,7 @@ phx-common-modules/
 │   │   ├── __init__.py
 │   │   ├── keycloak_config.py    # Keycloak configuration
 │   │   ├── keycloak_auth_provider.py  # Keycloak auth provider with auto-reconnect
+│   │   ├── keycloak_jwt_decoder.py  # JWT token decoder for user information
 │   │   └── keycloak_user.py      # Keycloak user model
 │   ├── models/                    # Data models
 │   │   ├── __init__.py
@@ -242,7 +244,7 @@ user = UserDto(
 ### Keycloak Authentication
 
 ```python
-from sucrim.keycloak import KeycloakAuthProvider, KeycloakUser, KeycloakConfig
+from sucrim.keycloak import KeycloakAuthProvider, KeycloakUser, KeycloakConfig, KeycloakJwtDecoder
 
 # Initialize auth provider
 config = KeycloakConfig()  # Reads from environment variables
@@ -281,6 +283,194 @@ user = KeycloakUser(
     email_verified=True
 )
 ```
+
+### Keycloak JWT Decoder
+
+The `KeycloakJwtDecoder` decodes JWT tokens from Keycloak and extracts user information. It automatically logs warnings when claims are missing from the token.
+
+#### Basic Usage
+
+```python
+from sucrim.keycloak import KeycloakJwtDecoder
+from sucrim.http.errors import UnauthorizedException
+
+# Decode JWT token and extract user information
+token = "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."  # Token from request header
+
+try:
+    user = KeycloakJwtDecoder.decode_token(token)
+    
+    # Access user information
+    print(f"Username: {user.username}")
+    print(f"Email: {user.email}")
+    print(f"Tenant ID: {user.tenant_id}")
+    print(f"Roles: {user.roles}")
+    print(f"Realm: {user.realm}")
+    
+except UnauthorizedException as e:
+    print(f"Failed to decode token: {e.message}")
+```
+
+#### Usage in FastAPI with Dependencies
+
+```python
+from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sucrim.keycloak import KeycloakJwtDecoder, KeycloakUser
+from sucrim.http.errors import UnauthorizedException
+
+app = FastAPI()
+security = HTTPBearer()
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> KeycloakUser:
+    """
+    Dependency to get current authenticated user from JWT token.
+    
+    Usage:
+        @app.get("/protected")
+        async def protected_route(user: KeycloakUser = Depends(get_current_user)):
+            return {"message": f"Hello {user.username}"}
+    """
+    try:
+        token = credentials.credentials
+        user = KeycloakJwtDecoder.decode_token(token)
+        
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+            
+        return user
+    except UnauthorizedException as e:
+        raise HTTPException(status_code=401, detail=e.message)
+
+@app.get("/users/me")
+async def get_current_user_info(user: KeycloakUser = Depends(get_current_user)):
+    """Get current authenticated user information."""
+    return {
+        "username": user.username,
+        "email": user.email,
+        "tenant_id": user.tenant_id,
+        "roles": user.roles,
+        "realm": user.realm
+    }
+```
+
+#### Usage with Role-Based Access Control
+
+```python
+from fastapi import Depends, HTTPException
+from sucrim.keycloak import KeycloakJwtDecoder, KeycloakUser
+from sucrim.http.errors import UnauthorizedException, ForbiddenException
+
+def require_role(required_role: str):
+    """
+    Dependency factory to require a specific role.
+    
+    Usage:
+        @app.get("/admin")
+        async def admin_route(user: KeycloakUser = Depends(require_role("admin"))):
+            return {"message": "Admin access granted"}
+    """
+    def role_checker(user: KeycloakUser = Depends(get_current_user)) -> KeycloakUser:
+        if required_role not in user.roles:
+            raise ForbiddenException(
+                message=f"User does not have required role: {required_role}",
+                process="role_validation"
+            )
+        return user
+    return role_checker
+
+@app.get("/admin/users")
+async def list_users(user: KeycloakUser = Depends(require_role("admin"))):
+    """Admin-only endpoint to list users."""
+    return {"message": f"Listing users for admin: {user.username}"}
+```
+
+#### Usage with Tenant Validation
+
+```python
+from sucrim.keycloak import KeycloakJwtDecoder, KeycloakUser
+from sucrim.http.errors import UnauthorizedException
+
+def get_current_user_with_tenant(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+) -> KeycloakUser:
+    """
+    Dependency that requires tenant_id in token.
+    """
+    try:
+        token = credentials.credentials
+        user = KeycloakJwtDecoder.decode_token(token)
+        
+        if not user.tenant_id:
+            raise UnauthorizedException(
+                message="Tenant ID is required but missing in token",
+                process="tenant_validation"
+            )
+            
+        return user
+    except UnauthorizedException as e:
+        raise HTTPException(status_code=401, detail=e.message)
+
+@app.get("/tenant/data")
+async def get_tenant_data(user: KeycloakUser = Depends(get_current_user_with_tenant)):
+    """Get data for the user's tenant."""
+    return {
+        "tenant_id": user.tenant_id,
+        "data": f"Data for tenant {user.tenant_id}"
+    }
+```
+
+#### Manual Token Extraction from Headers
+
+```python
+from fastapi import Request
+from sucrim.keycloak import KeycloakJwtDecoder
+from sucrim.http.errors import UnauthorizedException
+
+@app.get("/custom-auth")
+async def custom_auth_endpoint(request: Request):
+    """Example with manual token extraction."""
+    # Extract token from Authorization header
+    auth_header = request.headers.get("Authorization")
+    
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    
+    try:
+        # KeycloakJwtDecoder handles "Bearer " prefix automatically
+        user = KeycloakJwtDecoder.decode_token(auth_header)
+        
+        return {
+            "user": user.username,
+            "email": user.email,
+            "roles": user.roles
+        }
+    except UnauthorizedException as e:
+        raise HTTPException(status_code=401, detail=e.message)
+```
+
+#### Extracted Claims Mapping
+
+The decoder extracts the following information from JWT tokens:
+
+| KeycloakUser Field | JWT Claim | Description |
+|-------------------|-----------|-------------|
+| `username` | `preferred_username` | Username of the authenticated user |
+| `keycloak_user_id` | `sid` | Keycloak session/user ID |
+| `tenant_id` | `tenantId` | Tenant ID for multi-tenant applications |
+| `email` | `email` | User email address |
+| `first_name` | `given_name` | User first name |
+| `last_name` | `family_name` | User last name |
+| `realm` | `iss` (extracted) or `realm` | Keycloak realm name |
+| `client_id` | `azp` | Authorized party (client ID) |
+| `roles` | `realm_access.roles` + `resource_access.*.roles` | Combined list of realm and client roles |
+| `email_verified` | `email_verified` | Whether email is verified |
+
+**Note**: The decoder logs warnings when claims are missing from the token, making it easy to debug token issues during development.
+
+**Security Note**: The decoder extracts claims without signature verification. For production, you should verify the signature using Keycloak's public key for security.
 
 ### Date Utils
 
@@ -457,14 +647,14 @@ If the repository is public, you can install it directly:
 
 ```bash
 # Using uv
-uv pip install git+https://github.com/your-org/phx-common-modules.git
+uv pip install git+https://github.com/your-org/commons-python.git
 
 # Using pip
-pip install git+https://github.com/your-org/phx-common-modules.git
+pip install git+https://github.com/your-org/commons-python.git
 
 # Install specific branch or tag
-uv pip install git+https://github.com/your-org/phx-common-modules.git@main
-uv pip install git+https://github.com/your-org/phx-common-modules.git@v0.1.0
+uv pip install git+https://github.com/your-org/commons-python.git@main
+uv pip install git+https://github.com/your-org/commons-python.git@v0.1.0
 ```
 
 ### For Private Repositories
@@ -475,17 +665,17 @@ For private repositories, you have several options:
 
 ```bash
 # Using uv - install latest from main branch
-uv pip install git+ssh://git@github.com/your-org/phx-common-modules.git
+uv pip install git+ssh://git@github.com/your-org/commons-python.git
 
 # Install from specific tag
-uv pip install git+ssh://git@github.com/your-org/phx-common-modules.git@v0.1.0
+uv pip install git+ssh://git@github.com/your-org/commons-python.git@v0.1.0
 
 # Install from specific branch
-uv pip install git+ssh://git@github.com/your-org/phx-common-modules.git@main
+uv pip install git+ssh://git@github.com/your-org/commons-python.git@main
 
 # Using pip
-pip install git+ssh://git@github.com/your-org/phx-common-modules.git
-pip install git+ssh://git@github.com/your-org/phx-common-modules.git@v0.1.0
+pip install git+ssh://git@github.com/your-org/commons-python.git
+pip install git+ssh://git@github.com/your-org/commons-python.git@v0.1.0
 ```
 
 **Setup SSH key:**
@@ -497,17 +687,17 @@ pip install git+ssh://git@github.com/your-org/phx-common-modules.git@v0.1.0
 
 ```bash
 # Using uv - install latest from main branch
-uv pip install git+https://<TOKEN>@github.com/your-org/phx-common-modules.git
+uv pip install git+https://<TOKEN>@github.com/your-org/commons-python.git
 
 # Install from specific tag
-uv pip install git+https://<TOKEN>@github.com/your-org/phx-common-modules.git@v0.1.0
+uv pip install git+https://<TOKEN>@github.com/your-org/commons-python.git@v0.1.0
 
 # Install from specific branch
-uv pip install git+https://<TOKEN>@github.com/your-org/phx-common-modules.git@main
+uv pip install git+https://<TOKEN>@github.com/your-org/commons-python.git@main
 
 # Using pip
-pip install git+https://<TOKEN>@github.com/your-org/phx-common-modules.git
-pip install git+https://<TOKEN>@github.com/your-org/phx-common-modules.git@v0.1.0
+pip install git+https://<TOKEN>@github.com/your-org/commons-python.git
+pip install git+https://<TOKEN>@github.com/your-org/commons-python.git@v0.1.0
 ```
 
 **Create Personal Access Token:**
@@ -524,7 +714,7 @@ Configure Git to use credentials:
 git config --global credential.helper store
 
 # Then install
-uv pip install git+https://github.com/your-org/phx-common-modules.git
+uv pip install git+https://github.com/your-org/commons-python.git
 # Enter your GitHub username and Personal Access Token when prompted
 ```
 
@@ -533,17 +723,17 @@ uv pip install git+https://github.com/your-org/phx-common-modules.git
 **In requirements.txt:**
 ```
 # Install from main branch (latest)
-git+ssh://git@github.com/your-org/phx-common-modules.git
+git+ssh://git@github.com/your-org/commons-python.git
 # or
-git+https://<TOKEN>@github.com/your-org/phx-common-modules.git
+git+https://<TOKEN>@github.com/your-org/commons-python.git
 
 # Install from specific tag (recommended for production)
-git+ssh://git@github.com/your-org/phx-common-modules.git@v0.1.0
+git+ssh://git@github.com/your-org/commons-python.git@v0.1.0
 # or
-git+https://<TOKEN>@github.com/your-org/phx-common-modules.git@v0.1.0
+git+https://<TOKEN>@github.com/your-org/commons-python.git@v0.1.0
 
 # Install from specific branch
-git+ssh://git@github.com/your-org/phx-common-modules.git@develop
+git+ssh://git@github.com/your-org/commons-python.git@develop
 ```
 
 **In pyproject.toml:**
@@ -551,17 +741,17 @@ git+ssh://git@github.com/your-org/phx-common-modules.git@develop
 [project]
 dependencies = [
     # Install from main branch (latest)
-    "phx-common-modules @ git+ssh://git@github.com/your-org/phx-common-modules.git",
+    "commons-python @ git+ssh://git@github.com/your-org/commons-python.git",
     # or
-    "phx-common-modules @ git+https://<TOKEN>@github.com/your-org/phx-common-modules.git",
+    "commons-python @ git+https://<TOKEN>@github.com/your-org/commons-python.git",
     
     # Install from specific tag (recommended for production)
-    "phx-common-modules @ git+ssh://git@github.com/your-org/phx-common-modules.git@v0.1.0",
+    "commons-python @ git+ssh://git@github.com/your-org/commons-python.git@v0.1.0",
     # or
-    "phx-common-modules @ git+https://<TOKEN>@github.com/your-org/phx-common-modules.git@v0.1.0",
+    "commons-python @ git+https://<TOKEN>@github.com/your-org/commons-python.git@v0.1.0",
     
     # Install from specific branch
-    "phx-common-modules @ git+ssh://git@github.com/your-org/phx-common-modules.git@develop",
+    "commons-python @ git+ssh://git@github.com/your-org/commons-python.git@develop",
 ]
 ```
 
@@ -605,10 +795,10 @@ git show v0.1.0
 **Install from a tag:**
 ```bash
 # Using uv
-uv pip install git+ssh://git@github.com/your-org/phx-common-modules.git@v0.1.0
+uv pip install git+ssh://git@github.com/your-org/commons-python.git@v0.1.0
 
 # Using pip
-pip install git+ssh://git@github.com/your-org/phx-common-modules.git@v0.1.0
+pip install git+ssh://git@github.com/your-org/commons-python.git@v0.1.0
 ```
 
 ### Installing in Editable Mode (Development)
@@ -617,14 +807,14 @@ If you're actively developing and want changes to reflect immediately:
 
 ```bash
 # Clone the repository first
-git clone git@github.com/your-org/phx-common-modules.git
-cd phx-common-modules
+git clone git@github.com/your-org/commons-python.git
+cd commons-python
 
 # Install in editable mode
 uv pip install -e .
 
 # In your project, install from local path
-uv pip install -e /path/to/phx-common-modules
+uv pip install -e /path/to/commons-python
 ```
 
 ### Using in Your Project
@@ -637,7 +827,7 @@ from sucrim.http.response import ApiResponseDto
 from sucrim.models import Pagination
 from sucrim.utils import DateUtils, SortUtils, PaginationUtils
 from sucrim.dto import BaseAuditDto
-from sucrim.keycloak import KeycloakAuthProvider, KeycloakUser
+from sucrim.keycloak import KeycloakAuthProvider, KeycloakUser, KeycloakJwtDecoder
 
 # Your code here
 response = ApiResponseDto.ok({"data": "example"})

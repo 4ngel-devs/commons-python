@@ -1,5 +1,5 @@
 [project]
-name = "phx-common-modules"
+name = "commons-python"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
